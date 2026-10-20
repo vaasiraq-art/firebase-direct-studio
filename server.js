@@ -98,6 +98,7 @@ app.post('/api/firebase/create-project', route(async (req, res) => {
 app.post('/api/project/import-github', route(async (req, res) => exclusive(async () => {
   const repo = github.normalizeRepo(req.body?.repoUrl), auth = await github.credential(), meta = await github.request(`/repos/${repo.fullName}`, auth), branch = github.validateBranch(req.body?.branch || meta.default_branch);
   const target = path.join(WORKSPACES_DIR, `${repo.owner}--${repo.name}`);
+  try { if (fs.lstatSync(target).isSymbolicLink()) fail('A workspace cannot be a symbolic link or junction.'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (fs.existsSync(target)) {
     if (!fs.existsSync(path.join(target, '.git'))) fail('A folder with this name already exists. Choose it locally or rename it; it will not be deleted.');
     const origin = await github.scrubRemote(target); if (origin.fullName.toLowerCase() !== repo.fullName.toLowerCase()) fail('This workspace belongs to a different repository.');

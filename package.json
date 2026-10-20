@@ -20,9 +20,9 @@
   },
   "overrides": {
     "firebase-tools": {
-      "chokidar": "4.0.3",
-      "@google-cloud/pubsub": { "@opentelemetry/core": "2.8.0" }
+      "chokidar": "4.0.3"
     },
+    "@opentelemetry/core": "2.8.0",
     "gaxios@6.7.1": { "uuid": "11.1.1" }
   }
 }

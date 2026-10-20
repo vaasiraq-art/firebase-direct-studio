@@ -47,6 +47,7 @@ function Install-StudioDependencies($NodePath, $LogDir) {
     $installLog = Join-Path $LogDir 'install.log'
     $installErrorLog = Join-Path $LogDir 'install.error.log'
     $progressWindow = $null
+    $installProcess = $null
     try {
         if (-not $NoBrowser) {
             Add-Type -AssemblyName System.Windows.Forms
@@ -73,6 +74,9 @@ function Install-StudioDependencies($NodePath, $LogDir) {
             -ArgumentList @(('"' + $npmCli + '"'), 'ci', '--no-audit', '--no-fund') `
             -WorkingDirectory $workDir -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $installLog -RedirectStandardError $installErrorLog
+        # Windows PowerShell can lose ExitCode after Refresh/HasExited unless
+        # the native handle is opened while the process is still running.
+        $installHandle = $installProcess.Handle
         $deadline = [DateTime]::UtcNow.AddMinutes(10)
         while (-not $installProcess.HasExited) {
             if ($null -ne $progressWindow) { [System.Windows.Forms.Application]::DoEvents() }
@@ -84,12 +88,13 @@ function Install-StudioDependencies($NodePath, $LogDir) {
             Start-Sleep -Milliseconds 250
             $installProcess.Refresh()
         }
-        # WaitForExit makes the redirected streams and exit code available on Windows PowerShell.
         $installProcess.WaitForExit()
-        if ($installProcess.ExitCode -ne 0) {
+        $installExitCode = $installProcess.ExitCode
+        if ($null -eq $installExitCode -or $installExitCode -ne 0) {
             throw "Dependency setup failed. Check your internet connection and try again. Details: $installErrorLog"
         }
     } finally {
+        if ($null -ne $installProcess) { $installProcess.Dispose() }
         if ($null -ne $progressWindow) { $progressWindow.Close(); $progressWindow.Dispose() }
     }
 }
@@ -113,7 +118,8 @@ try {
 
         $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $nodeCommand) { throw 'Node.js is missing. Install Node.js 22.16 or newer, then open this shortcut again.' }
-        $logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'FirebaseDirectStudio\logs'
+        $dataDir = if ($env:FDS_DATA_DIR) { $env:FDS_DATA_DIR } else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'FirebaseDirectStudio' }
+        $logDir = Join-Path $dataDir 'logs'
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         if (-not (Test-Path -LiteralPath (Join-Path $workDir 'node_modules\express\package.json')) -or
             -not (Test-Path -LiteralPath (Join-Path $workDir 'node_modules\firebase-tools\package.json'))) {

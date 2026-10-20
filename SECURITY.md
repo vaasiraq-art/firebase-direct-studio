@@ -35,10 +35,10 @@ The bundled Firebase CLI is pinned to `firebase-tools@15.34.0`. Scoped npm overr
 | Dependency | Pinned override | Compatibility considered |
 | --- | --- | --- |
 | Firebase CLI's `chokidar` | `4.0.3` | Removes the unpatched `braces` dependency. CommonJS `watch` and `FSWatcher` remain available; v4 removes glob support. This dashboard uses Firebase Hosting and account/project commands, not emulator watchers. |
-| Pub/Sub's `@opentelemetry/core` | `2.8.0` | Patches baggage parsing limits. The bundled Pub/Sub client uses `W3CTraceContextPropagator`; the required OpenTelemetry API peer version is retained. |
+| `@opentelemetry/core` | `2.8.0` | Patches baggage parsing limits. Its installed consumer is the bundled Pub/Sub client, which uses `W3CTraceContextPropagator`; the required OpenTelemetry API peer version is retained. |
 | `gaxios@6.7.1`'s `uuid` | `11.1.1` | Patches UUID buffer bounds checks and retains CommonJS exports. Gaxios uses the compatible zero-argument `v4()` call. |
 
-These overrides are scoped to the dependency paths in `package.json` and recorded in the lockfile. Compatibility validation covers this dashboard's Hosting flow; it does not establish compatibility for all commands or emulators in the bundled CLI. Use a separate upstream Firebase CLI installation for emulator workflows.
+The Chokidar and UUID overrides are scoped to the dependency paths in `package.json`; the Core override applies across the dependency tree to keep installation reproducible across npm versions. All are recorded in the lockfile. Compatibility validation covers this dashboard's Hosting flow; it does not establish compatibility for all commands or emulators in the bundled CLI. Use a separate upstream Firebase CLI installation for emulator workflows.
 
 References: [braces advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm), [Chokidar migration notes](https://github.com/paulmillr/chokidar#upgrading), [OpenTelemetry advisory](https://github.com/advisories/GHSA-8988-4f7v-96qf), and [UUID advisory](https://github.com/advisories/GHSA-w5hq-g745-h8pq).
 
