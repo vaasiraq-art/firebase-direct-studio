@@ -120,7 +120,13 @@ function findEffectiveRoot(repoRoot, options = {}) {
   }
   const rootCandidate = appRoots.find(item => item.path === '.');
   const packageCandidates = appRoots.filter(item => fileExists(path.join(root, item.path, 'package.json')));
-  const selected = rootCandidate || (packageCandidates.length === 1 ? packageCandidates[0] : (appRoots.length === 1 ? appRoots[0] : null));
+  const nextCandidates = options.deploymentMode === 'apphosting' ? packageCandidates.filter(item => {
+    const pkg = safeReadJson(path.join(root, item.path, 'package.json'));
+    return Boolean(pkg?.dependencies?.next || pkg?.devDependencies?.next);
+  }) : [];
+  const selected = options.deploymentMode === 'apphosting' && nextCandidates.length
+    ? (nextCandidates.find(item => item.path === '.') || (nextCandidates.length === 1 ? nextCandidates[0] : null))
+    : rootCandidate || (packageCandidates.length === 1 ? packageCandidates[0] : (appRoots.length === 1 ? appRoots[0] : null));
   return {
     effectiveRoot: selected ? safeResolve(root, selected.path, false) : root,
     relativeSubdir: selected && selected.path !== '.' ? selected.path : '',
@@ -140,7 +146,95 @@ function detectAngularOutputDir(root) {
   return project ? `dist/${Object.keys(config.projects)[0]}${applicationBuilder ? '/browser' : ''}` : 'dist';
 }
 
+// Small, conservative lexer for one safe edit. It never evaluates the Next.js
+// configuration. Wrapped, computed, mutated, or spread configs require manual edits.
+function configTokens(source) {
+  const tokens = [];
+  for (let index = 0; index < source.length;) {
+    if (/\s/.test(source[index])) { index++; continue; }
+    if (source.startsWith('//', index)) { const end = source.indexOf('\n', index); index = end < 0 ? source.length : end + 1; continue; }
+    if (source.startsWith('/*', index)) { const end = source.indexOf('*/', index + 2); if (end < 0) return null; index = end + 2; continue; }
+    const start = index;
+    const quote = source[index];
+    if (quote === '"' || quote === "'") {
+      index++;
+      while (index < source.length && source[index] !== quote) {
+        if (source[index] === '\\') index++;
+        index++;
+      }
+      if (index >= source.length) return null;
+      tokens.push({ type: 'string', value: source.slice(start + 1, index), start, end: ++index });
+      continue;
+    }
+    // Regex and template literals require a JavaScript parser; do not guess at them.
+    if (quote === '`' || quote === '/') return null;
+    if (/[a-zA-Z_$]/.test(source[index])) {
+      while (index < source.length && /[a-zA-Z0-9_$]/.test(source[index])) index++;
+      tokens.push({ type: 'identifier', value: source.slice(start, index), start, end: index });
+      continue;
+    }
+    if (source.startsWith('...', index)) { tokens.push({ type: 'symbol', value: '...', start, end: index + 3 }); index += 3; continue; }
+    tokens.push({ type: 'symbol', value: source[index], start, end: ++index });
+  }
+  return tokens;
+}
+
+function staticExportRemovalPlan(source) {
+  const tokens = configTokens(source);
+  const fallback = tokens
+    ? tokens.some((token, index) => token.value === 'output' && [':', '='].includes(tokens[index + 1]?.value) && tokens[index + 2]?.type === 'string' && tokens[index + 2].value === 'export')
+    : /\boutput\b["']?\s*[:=]\s*["']export["']/.test(source);
+  const unsafe = { hasStaticExport: fallback, content: null };
+  if (!tokens) return unsafe;
+  const exports = [];
+  for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index].value === 'export' && tokens[index + 1]?.value === 'default') exports.push(index + 2);
+    if (tokens[index].value === 'module' && tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'exports' && tokens[index + 3]?.value === '=') exports.push(index + 4);
+  }
+  if (exports.length !== 1) return unsafe;
+  let opening = exports[0];
+  if (tokens[opening]?.value !== '{') {
+    const name = tokens[opening];
+    if (name?.type !== 'identifier' || (tokens[opening + 1] && tokens[opening + 1].value !== ';')) return unsafe;
+    if (tokens.filter(token => token.type === 'identifier' && token.value === name.value).length !== 2) return unsafe;
+    const declarations = [];
+    for (let index = 0; index < opening; index++) {
+      if (!['const', 'let', 'var'].includes(tokens[index].value) || tokens[index + 1]?.value !== name.value) continue;
+      let equals = index + 2;
+      while (equals < opening && !['=', ';'].includes(tokens[equals].value)) equals++;
+      if (tokens[equals]?.value === '=' && tokens[equals + 1]?.value === '{') declarations.push(equals + 1);
+    }
+    if (declarations.length !== 1) return unsafe;
+    opening = declarations[0];
+  }
+  let depth = 0;
+  let closing = -1;
+  let previousComma = -1;
+  const properties = [];
+  for (let index = opening + 1; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (depth === 0 && token.value === '}') { closing = index; break; }
+    if (depth === 0 && (token.value === '...' || (token.value === '[' && (index === opening + 1 || tokens[index - 1]?.value === ',')))) return unsafe;
+    if (depth === 0 && token.value === ',') previousComma = index;
+    if (depth === 0 && ['string', 'identifier'].includes(token.type) && token.value === 'output' && tokens[index + 1]?.value === ':') {
+      if (tokens[index + 2]?.type !== 'string' || tokens[index + 2]?.value !== 'export' || ![',', '}'].includes(tokens[index + 3]?.value)) return unsafe;
+      properties.push({ key: index, value: index + 2, following: index + 3, previousComma });
+    }
+    if (['{', '[', '('].includes(token.value)) depth++;
+    if (['}', ']', ')'].includes(token.value)) depth--;
+    if (depth < 0) return unsafe;
+  }
+  if (closing < 0) return unsafe;
+  if (properties.length !== 1) return { hasStaticExport: properties.length > 0, content: null };
+  const property = properties[0];
+  const start = tokens[property.following].value === ',' || property.previousComma < 0 ? tokens[property.key].start : tokens[property.previousComma].start;
+  const end = tokens[property.following].value === ',' ? tokens[property.following].end : tokens[property.value].end;
+  return { hasStaticExport: true, content: source.slice(0, start) + source.slice(end) };
+}
+
 function inspectProject(repoRoot, targetFirebaseProject = '', options = {}) {
+  const deploymentMode = options.deploymentMode || 'hosting';
+  if (!['hosting', 'apphosting'].includes(deploymentMode)) throw new Error('Deployment mode must be hosting or apphosting.');
   const root = path.resolve(repoRoot);
   const { effectiveRoot, relativeSubdir, appRoots, ambiguous } = findEffectiveRoot(root, options);
   const pkgPath = path.join(effectiveRoot, 'package.json');
@@ -154,6 +248,12 @@ function inspectProject(repoRoot, targetFirebaseProject = '', options = {}) {
   let expectedPublicDir = '.';
   let needsBuild = false;
   let isSPA = false;
+  let nextConfigPath = '';
+  let nextConfigText = '';
+  let hasStaticExport = false;
+  let exportRemoval = null;
+  const runtimeFeatures = [];
+  const environmentVariables = new Set();
   const configFile = names => names.map(name => path.join(effectiveRoot, name)).find(fileExists);
 
   if (ambiguous) issue('MULTIPLE_APP_ROOTS', 'error', 'Choose the app subfolder', 'This repository contains several apps. Choose the folder that you want to build and deploy.');
@@ -195,17 +295,32 @@ function inspectProject(repoRoot, targetFirebaseProject = '', options = {}) {
   }
 
   if (framework === 'nextjs') {
-    const next = configFile(['next.config.js', 'next.config.mjs', 'next.config.ts']);
-    const nextText = next ? safeReadText(next) : '';
-    if (!/\boutput\s*:\s*['"]export['"]/.test(nextText)) issue('NEXTJS_STATIC_EXPORT', 'error', 'Next.js needs an explicit static export', 'Static Hosting serves exported files only. This app is not configured with output: "export". Server features may need Firebase App Hosting or another server platform; Auto-Fix will not rewrite it into a different app.');
+    if (['next.config.js', 'next.config.mjs', 'next.config.ts'].some(name => entryExists(path.join(effectiveRoot, name)) && !fileExists(path.join(effectiveRoot, name)))) issue('INVALID_NEXT_CONFIG', 'error', 'Next.js configuration must be a regular local file', 'Remove symbolic links and junctions from the Next.js config path before deployment.');
+    nextConfigPath = configFile(['next.config.js', 'next.config.mjs', 'next.config.ts']) || '';
+    nextConfigText = nextConfigPath ? safeReadText(nextConfigPath, 250000) : '';
+    exportRemoval = staticExportRemovalPlan(nextConfigText);
+    hasStaticExport = exportRemoval.hasStaticExport;
+    if (deploymentMode === 'hosting' && !hasStaticExport) issue('NEXTJS_STATIC_EXPORT', 'error', 'Next.js needs an explicit static export', 'Static Hosting serves exported files only. This app is not configured with output: "export". Choose Firebase App Hosting to run the full Next.js app, including server features. Auto-Fix will not rewrite it into a static app.');
     const sourceFiles = walkSources(effectiveRoot);
     const runtimeFiles = sourceFiles.filter(file => /(^|\/)(?:middleware|proxy)\.[cm]?[jt]s$/.test(file) || /(^|\/)(?:src\/)?pages\/api\//.test(file) || /(^|\/)app\/(?:.*\/)?route\.[jt]s$/.test(file));
+    if (sourceFiles.some(file => /(^|\/)(?:src\/)?pages\/api\/|(^|\/)app\/(?:.*\/)?route\.[jt]s$/.test(file))) runtimeFeatures.push('api-routes');
+    if (sourceFiles.some(file => /(^|\/)(?:middleware|proxy)\.[cm]?[jt]s$/.test(file))) runtimeFeatures.push('middleware');
+    if (['pg', 'mysql2', 'better-sqlite3', '@prisma/client', 'drizzle-orm', '@aws-sdk/client-rds-data', '@electric-sql/pglite'].some(name => deps[name])) runtimeFeatures.push('database');
     for (const file of sourceFiles) {
       if (!/\.[cm]?[jt]sx?$/.test(file) || /(^|\/)(?:next|eslint|postcss|tailwind)\.config\./.test(file)) continue;
       const source = safeReadText(path.join(effectiveRoot, file), 60000);
+      if (/['"]use server['"]/.test(source) && !runtimeFeatures.includes('server-actions')) runtimeFeatures.push('server-actions');
+      if (/\bgetServerSideProps\b|\b(?:dynamic|fetchCache)\s*=\s*['"](?:force-dynamic|force-no-store)['"]|from\s*['"]next\/headers['"]/.test(source) && !runtimeFeatures.includes('request-runtime')) runtimeFeatures.push('request-runtime');
+      if (/require\(\s*['"](?:pg|mysql2|better-sqlite3)['"]|from\s*['"](?:pg|mysql2|better-sqlite3|@prisma\/client)['"]/.test(source) && !runtimeFeatures.includes('database')) runtimeFeatures.push('database');
+      for (const match of source.matchAll(/\bprocess\.env(?:\.([A-Z][A-Z0-9_]*)|\[['"]([A-Z][A-Z0-9_]*)['"]\])/g)) {
+        const name = match[1] || match[2];
+        if (!['NODE_ENV', 'PORT', 'HOSTNAME', 'CI', 'NEXT_RUNTIME', 'NEXT_PHASE', 'VERCEL'].includes(name) && environmentVariables.size < 80) environmentVariables.add(name);
+      }
       if (/['"]use server['"]|\bgetServerSideProps\b|\b(?:dynamic|fetchCache)\s*=\s*['"](?:force-dynamic|force-no-store)['"]|from\s*['"]next\/headers['"]|require\(\s*['"](?:pg|mysql2|better-sqlite3)['"]|from\s*['"](?:pg|mysql2|better-sqlite3|@prisma\/client)['"]/.test(source)) runtimeFiles.push(file);
     }
-    if (/\bserverActions\s*:/.test(nextText) || runtimeFiles.length) issue('NEXTJS_SERVER_RUNTIME', 'error', 'This Next.js app uses server features', `Static Hosting cannot run API routes, server actions, request cookies, middleware, or database code. ${runtimeFiles.length ? `Detected: ${[...new Set(runtimeFiles)].slice(0, 5).join(', ')}.` : 'Server actions are configured.'} Choose server hosting or a separate static frontend.`);
+    if (/\bserverActions\s*:/.test(nextConfigText) && !runtimeFeatures.includes('server-actions')) runtimeFeatures.push('server-actions');
+    if (deploymentMode === 'hosting' && (runtimeFeatures.length || runtimeFiles.length)) issue('NEXTJS_SERVER_RUNTIME', 'error', 'This Next.js app uses server features', `Static Hosting cannot run API routes, server actions, request cookies, middleware, or database code. ${runtimeFiles.length ? `Detected: ${[...new Set(runtimeFiles)].slice(0, 5).join(', ')}.` : 'Server features are configured.'} Choose Firebase App Hosting to preserve the full app.`);
+    if (deploymentMode === 'apphosting' && hasStaticExport) issue('APPHOSTING_STATIC_EXPORT', 'error', 'Remove static export for the Next.js server runtime', exportRemoval.content !== null ? 'Auto-Fix can remove the explicit output: "export" property while preserving server routes, actions, and all other configuration. The original config is backed up.' : 'This dynamic or wrapped Next.js config enables static export. Remove output: "export" from the exported config manually so App Hosting can build the server runtime. No config was changed.', exportRemoval.content !== null, { nextConfigPath });
   }
 
   if (framework === 'sveltekit') {
@@ -256,13 +371,37 @@ function inspectProject(repoRoot, targetFirebaseProject = '', options = {}) {
   const currentBoundProject = rc?.projects?.default || '';
   if (entryExists(rcPath) && !rc) issue('INVALID_FIREBASERC', 'error', 'Cannot read .firebaserc', 'Repair its JSON or remove the symbolic link before linking a Firebase project.');
   else if (targetFirebaseProject && currentBoundProject !== targetFirebaseProject) issue('MISMATCH_FIREBASERC', 'info', `Link to ${targetFirebaseProject}`, 'Auto-Fix updates the default project while preserving other aliases and targets.', true);
+  const staticCompatible = framework === 'nextjs' ? hasStaticExport && runtimeFeatures.length === 0 : !issues.some(item => ['NO_HTML_FOUND', 'ASTRO_SERVER_RUNTIME', 'SVELTEKIT_STATIC_ADAPTER', 'SVELTEKIT_SERVER_RUNTIME'].includes(item.id));
+  const appHostingCompatible = framework === 'nextjs' && Boolean(deps.next);
+  if (deploymentMode === 'apphosting') {
+    // App Hosting builds and runs the source app. Static output and Firebase Hosting
+    // configuration do not apply, and must never be generated or rewritten here.
+    const staticIssueIds = new Set(['NO_HTML_FOUND', 'BUILD_OUTPUT_PENDING', 'UNSAFE_OUTPUT_PATH', 'FIREBASE_PLACEHOLDER', 'GENERATED_PLACEHOLDER', 'MISSING_FIREBASE_JSON', 'INVALID_FIREBASE_JSON', 'MULTISITE_HOSTING', 'FRAMEWORK_HOSTING', 'INVALID_HOSTING_ROUTES', 'HOSTING_SERVER_REWRITES', 'HOSTING_EXPLICIT_TARGET', 'UNSAFE_HOSTING_PATH', 'WRONG_PUBLIC_DIR', 'HOSTING_SECRET_IGNORES', 'SPA_ROUTING', 'CUSTOM_ROUTING', 'INVALID_FIREBASERC', 'MISMATCH_FIREBASERC', 'VITE_BASE_PATH', 'GITHUB_PAGES_HOMEPAGE']);
+    for (let index = issues.length - 1; index >= 0; index--) if (staticIssueIds.has(issues[index].id)) issues.splice(index, 1);
+    if (!appHostingCompatible) issue('APPHOSTING_FRAMEWORK_UNSUPPORTED', 'error', 'Choose a Next.js app for App Hosting', 'This deployment mode currently supports Next.js projects with a next dependency and production build script. Choose the Next.js app subfolder, or use static Hosting for a static website.');
+    if (!pkg) issue('APPHOSTING_PACKAGE_REQUIRED', 'error', 'App Hosting needs package.json', 'Choose the Next.js source folder containing a valid package.json.');
+    if (pkg && ((typeof pkg.packageManager === 'string' && !/^npm@/.test(pkg.packageManager)) || (!fileExists(path.join(effectiveRoot, 'package-lock.json')) && !fileExists(path.join(effectiveRoot, 'npm-shrinkwrap.json')) && ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'].some(file => entryExists(path.join(effectiveRoot, file)))))) issue('APPHOSTING_PACKAGE_MANAGER', 'error', 'This local deployment flow currently uses npm', 'Use an npm package-lock.json for this app, or deploy with the package manager supported by your own App Hosting workflow. No lockfiles were changed.');
+    else if (pkg && !fileExists(path.join(effectiveRoot, 'package-lock.json')) && !fileExists(path.join(effectiveRoot, 'npm-shrinkwrap.json'))) issue('APPHOSTING_LOCKFILE', 'warning', 'Commit an npm lockfile for repeatable builds', 'App Hosting installs the app dependencies in the cloud. A package-lock.json or npm-shrinkwrap.json keeps dependency versions repeatable.');
+    if (runtimeFeatures.includes('database')) issue('APPHOSTING_DATABASE', 'info', 'Backend database connections are preserved', 'Configure the database and storage connection settings for the cloud runtime. Deploying the Next.js server does not create or migrate an external database.');
+    if (environmentVariables.size) issue('APPHOSTING_ENVIRONMENT', 'info', 'Configure the app environment for cloud builds and runtime', `The source references these variable names: ${[...environmentVariables].sort().join(', ')}. Add the values or Secret Manager references in App Hosting; local .env contents are not shared with the AI.`);
+    expectedPublicDir = '';
+    publicAbsolutePath = '';
+  }
+  const recommendedDeploymentMode = framework === 'nextjs' && (!hasStaticExport || runtimeFeatures.length) ? 'apphosting' : 'hosting';
   const blockReasons = issues.filter(item => item.severity === 'error' && !item.autoFixable).map(item => item.description);
   return {
     repoRoot: root, effectiveRoot, relativeSubdir, appRoots, framework, frameworkLabel,
     needsBuild, buildScript: needsBuild ? 'build' : '', expectedPublicDir, publicAbsolutePath,
     hostingConfigPath, isSPA, currentBoundProject, hasPackageJson: Boolean(pkg),
     packageName: pkg?.name || path.basename(effectiveRoot), issues,
-    blocked: blockReasons.length > 0, blockReasons, outputReady
+    blocked: blockReasons.length > 0, blockReasons, outputReady: deploymentMode === 'hosting' ? outputReady : false,
+    deploymentMode, recommendedDeploymentMode,
+    deploymentModes: [
+      { id: 'hosting', label: 'Static Hosting', supported: staticCompatible, reason: staticCompatible ? 'Publish production website files.' : 'This app needs a server runtime or a valid static frontend.' },
+      { id: 'apphosting', label: 'Next.js App Hosting', supported: appHostingCompatible, reason: appHostingCompatible ? 'Build and run the full Next.js server app.' : 'Choose a Next.js app with a next dependency.' }
+    ],
+    capabilities: { staticHosting: staticCompatible, appHosting: appHostingCompatible, serverRendering: framework === 'nextjs', apiRoutes: runtimeFeatures.includes('api-routes'), serverActions: runtimeFeatures.includes('server-actions'), database: runtimeFeatures.includes('database'), runtime: framework === 'nextjs' ? 'nodejs' : null },
+    runtimeFeatures, environmentVariables: [...environmentVariables].sort(), nextConfigPath, hasStaticExport
   };
 }
 
@@ -271,6 +410,7 @@ function applyAutoFixes(repoRoot, targetFirebaseProject = '', options = {}) {
   const report = inspectProject(repoRoot, targetFirebaseProject, options);
   const { effectiveRoot, expectedPublicDir, isSPA, issues } = report;
   const fixedLogs = [];
+  const changedFiles = [];
   let backupDir = '';
   let backupBase = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'FirebaseDirectStudio', 'backups');
   if (inside(effectiveRoot, backupBase)) backupBase = path.join(os.tmpdir(), 'FirebaseDirectStudio', 'backups');
@@ -290,8 +430,19 @@ function applyAutoFixes(repoRoot, targetFirebaseProject = '', options = {}) {
       fs.writeFileSync(backupPath, before, { mode: 0o600 });
     }
     fs.writeFileSync(dest, text, { mode: 0o600 });
+    changedFiles.push(relative.replace(/\\/g, '/'));
   };
-  if (report.blocked) return { fixedLogs: ['Resolve the blocking issues before applying automatic changes.'], backupDir, updatedInspection: report };
+  if (report.blocked) return { fixedLogs: ['Resolve the blocking issues before applying automatic changes.'], backupDir, changedFiles, updatedInspection: report };
+  if (report.deploymentMode === 'apphosting') {
+    if (report.hasStaticExport) {
+      const source = safeReadText(report.nextConfigPath, 250000);
+      const plan = staticExportRemovalPlan(source);
+      if (plan.content === null) return { fixedLogs: ['Remove static export manually from the dynamic Next.js configuration.'], backupDir, changedFiles, updatedInspection: report };
+      write(path.relative(effectiveRoot, report.nextConfigPath), plan.content);
+      fixedLogs.push('Removed the explicit static export setting; server routes, actions, and the remaining Next.js configuration were preserved.');
+    } else fixedLogs.push('Next.js server configuration is ready for App Hosting; no source changes were needed.');
+    return { fixedLogs, backupDir, changedFiles, updatedInspection: inspectProject(repoRoot, targetFirebaseProject, options) };
+  }
   for (const item of issues) {
     if (item.id === 'GITHUB_PAGES_HOMEPAGE') {
       const pkg = safeReadJson(path.join(effectiveRoot, 'package.json'));
@@ -321,7 +472,7 @@ function applyAutoFixes(repoRoot, targetFirebaseProject = '', options = {}) {
     write('.firebaserc', JSON.stringify(rc, null, 2) + '\n');
     fixedLogs.push(`Linked the default Firebase project to ${targetFirebaseProject}.`);
   }
-  return { fixedLogs, backupDir, updatedInspection: inspectProject(repoRoot, targetFirebaseProject, options) };
+  return { fixedLogs, backupDir, changedFiles, updatedInspection: inspectProject(repoRoot, targetFirebaseProject, options) };
 }
 
 function globMatches(relative, pattern) {
@@ -331,6 +482,7 @@ function globMatches(relative, pattern) {
 }
 
 function validateHostingOutput(report) {
+  if (report?.deploymentMode && report.deploymentMode !== 'hosting') throw new Error('Static Hosting validation cannot be used for an App Hosting project.');
   if (!report || report.blocked) throw new Error(report?.blockReasons?.join('\n') || 'Project inspection is required before deployment.');
   const output = safeResolve(report.effectiveRoot, report.expectedPublicDir, false);
   if (!dirExists(output) || !fileExists(path.join(output, 'index.html'))) throw new Error(`Build did not produce ${report.expectedPublicDir}/index.html. Nothing was deployed.`);
@@ -356,6 +508,22 @@ function validateHostingOutput(report) {
   }
   visit(output);
   return { outputDir: output, fileCount };
+}
+
+function validateAppHostingProject(report) {
+  if (!report || report.deploymentMode !== 'apphosting') throw new Error('Select App Hosting mode before deploying the Next.js runtime.');
+  // Inspect again so a stale browser report cannot bypass a changed config or path.
+  const current = inspectProject(report.repoRoot, '', { deploymentMode: 'apphosting', appSubdir: report.relativeSubdir || '.' });
+  const errors = current.issues.filter(issue => issue.severity === 'error');
+  if (errors.length) throw new Error(errors.map(issue => issue.description).join('\n'));
+  if (current.framework !== 'nextjs' || !current.needsBuild) throw new Error('App Hosting requires a Next.js dependency and a production build script.');
+  const packagePath = safeResolve(current.effectiveRoot, 'package.json', false);
+  const pkg = safeReadJson(packagePath);
+  if (!pkg?.dependencies?.next && !pkg?.devDependencies?.next) throw new Error('The selected package.json does not include Next.js.');
+  for (const name of ['package-lock.json', 'npm-shrinkwrap.json', 'next.config.js', 'next.config.mjs', 'next.config.ts', 'apphosting.yaml']) {
+    if (entryExists(path.join(current.effectiveRoot, name))) safeResolve(current.effectiveRoot, name, false);
+  }
+  return { sourceDir: current.effectiveRoot, packagePath, framework: 'nextjs', packageManager: 'npm', buildScript: 'build', runtimeFeatures: current.runtimeFeatures, environmentVariables: current.environmentVariables };
 }
 
 function gatherProjectContextForAI(effectiveRoot, errorLog = '') {
@@ -395,4 +563,4 @@ function hasEmbeddedSecret(content) {
   return /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{30,}|\bsk-(?:proj-|ant-api\d+-)?[A-Za-z0-9_-]{20,}|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}|\bAKIA[0-9A-Z]{16}\b|\bxox[bpars]-[A-Za-z0-9-]{15,}|\b(?:api[_-]?key|password|passwd|secret|token|client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key)["']?\s*(?:=|:)\s*["'`][^"'`\r\n]+["'`]/i.test(content);
 }
 
-module.exports = { inspectProject, applyAutoFixes, gatherProjectContextForAI, findEffectiveRoot, validateHostingOutput };
+module.exports = { inspectProject, applyAutoFixes, gatherProjectContextForAI, findEffectiveRoot, validateHostingOutput, validateAppHostingProject };

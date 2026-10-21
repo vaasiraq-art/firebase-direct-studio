@@ -1,12 +1,12 @@
 {
   "name": "firebase-direct-studio",
-  "version": "2.0.0",
-  "description": "Local GitHub to Firebase Hosting deployment dashboard with optional AI repair",
+  "version": "2.1.0",
+  "description": "Local GitHub to Firebase Hosting and Next.js App Hosting dashboard with optional AI repair",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server.js && node --check public/app.js",
+    "check": "node --check server.js && node --check public/app.js && node --check public/theme.js",
     "release:check": "node scripts/check-release.js"
   },
   "private": true,
@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
+    "ignore": "7.0.13",
     "firebase-tools": "15.34.0"
   },
   "overrides": {

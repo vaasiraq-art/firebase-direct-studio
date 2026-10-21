@@ -16,6 +16,7 @@ const config = require('../lib/config');
 // Importing the test server must never migrate the real project's legacy config.
 config.migrateLegacyConfig = () => {};
 const processes = require('../lib/process');
+const firebaseClient = require('../lib/firebase');
 let runMock = async () => { throw new Error('Unexpected external command in server test.'); };
 processes.run = (...args) => runMock(...args);
 processes.command = (name, args) => ({ file: name, args });
@@ -117,13 +118,9 @@ test('AI patch paths reject traversal, secrets, lockfiles, and symbolic-link esc
   assert.throws(() => safePatchFile(project, 'linked/source.js'), /symbolic links/);
 });
 
-test('Firebase status returns only identity and project metadata, never CLI tokens', async () => {
-  runMock = async (name, args) => {
-    assert.equal(name, 'firebase');
-    if (args[0] === 'login:list') return { code: 0, stdout: JSON.stringify({ status: 'success', result: [{ user: { email: 'test@example.invalid' }, tokens: { refresh_token: 'firebase-refresh-secret', access_token: 'firebase-access-secret' } }] }), stderr: '' };
-    if (args[0] === 'projects:list') return { code: 0, stdout: JSON.stringify({ status: 'success', result: [{ projectId: 'test-site-2026', displayName: 'Test site', internal: 'ignored' }] }), stderr: '' };
-    throw new Error('Unexpected command');
-  };
+test('Firebase status returns verified account metadata through its bounded API client', async t => {
+  t.mock.method(firebaseClient, 'status', async () => ({ isLoggedIn: true, email: 'test@example.invalid', projects: [{ projectId: 'test-site-2026', displayName: 'Test site' }], connectionStatus: 'connected', cliAvailable: true, message: '' }));
+  runMock = async () => { throw new Error('Status must not launch the hanging Firebase CLI.'); };
   const response = await request('/api/firebase/status');
   assert.equal(response.status, 200);
   assert.equal(response.json.isLoggedIn, true);
@@ -248,4 +245,165 @@ test('failed GitHub sync stops deployment before configuration, installation, or
   assert.equal(job.liveUrl, '');
   assert.equal(commandCalled, false);
   assert.equal(fs.existsSync(path.join(root, 'firebase.json')), false);
+});
+
+function runtimeProject(name, configText = 'export default {};') {
+  const root = path.join(temp, name), app = path.join(root, 'web');
+  fs.mkdirSync(path.join(app, 'app', 'api', 'health'), { recursive: true });
+  fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify({ name: 'runtime-fixture', scripts: { build: 'next build', start: 'next start' }, dependencies: { next: '16.0.0', react: '19.0.0' } }));
+  fs.writeFileSync(path.join(app, 'next.config.mjs'), configText);
+  fs.writeFileSync(path.join(app, 'app', 'api', 'health', 'route.js'), 'export function GET() { return Response.json({ok:true}); }');
+  fs.writeFileSync(path.join(app, '.env.local'), 'DO_NOT_UPLOAD=synthetic-private-value');
+  const cfg = config.loadConfig();
+  config.saveConfig({ activeProjectPath: root, appSubdir: 'web', deploymentMode: 'auto', recentProjects: [...cfg.recentProjects, { name, path: root, sourceType: 'local' }] });
+  return { root, app };
+}
+const runtimeBackend = { id: 'test-backend', name: 'projects/test-project/locations/us-east4/backends/test-backend', location: 'us-east4', uri: 'https://test-backend--test-project.us-east4.hosted.app' };
+
+test('Next.js server apps automatically select App Hosting and preserve API files', async () => {
+  const { root, app } = runtimeProject('runtime-selection');
+  const selected = await post('/api/project/select', { projectPath: root, deploymentMode: 'auto', appSubdir: 'web' });
+  assert.equal(selected.status, 200);
+  assert.equal(selected.json.inspection.deploymentMode, 'apphosting');
+  assert.equal(selected.json.inspection.blocked, false);
+  const fixed = await post('/api/project/autofix', { projectPath: root, deploymentMode: 'auto', appSubdir: 'web' });
+  assert.equal(fixed.status, 200);
+  assert.deepEqual(fixed.json.changedFiles, []);
+  assert.equal(fs.existsSync(path.join(app, 'app', 'api', 'health', 'route.js')), true);
+  assert.equal(fs.existsSync(path.join(app, 'firebase.json')), false);
+  assert.equal(fs.existsSync(path.join(app, '.firebaserc')), false);
+});
+
+test('App Hosting deploy stages protected source and reports a verified runtime URL', async t => {
+  const { root, app } = runtimeProject('runtime-deployment', "export default { output: 'export', poweredByHeader: false };");
+  t.mock.method(firebaseClient, 'billing', async () => true);
+  t.mock.method(firebaseClient, 'appHostingStatus', async () => ({ billingEnabled: true, backends: [runtimeBackend] }));
+  t.mock.method(firebaseClient, 'getBackend', async () => ({ name: runtimeBackend.name, uri: runtimeBackend.uri }));
+  const baseline = [];
+  t.mock.method(firebaseClient, 'assertNoActiveDeployment', async () => {});
+  t.mock.method(firebaseClient, 'listRollouts', async () => baseline);
+  t.mock.method(firebaseClient, 'verifyRollout', async (project, name, previous) => { assert.equal(project, 'test-project'); assert.equal(name, runtimeBackend.name); assert.equal(previous, baseline); return { rolloutName: runtimeBackend.name + '/rollouts/new-release', buildName: runtimeBackend.name + '/builds/new-build' }; });
+  let inspected = false;
+  runMock = async (name, args, options) => {
+    assert.equal(name, 'firebase'); assert.equal(args[0], 'deploy');
+    assert.equal(args[args.indexOf('--only') + 1], 'apphosting:test-backend');
+    assert.ok(args.includes('--non-interactive'));
+    const staging = JSON.parse(fs.readFileSync(args[args.indexOf('--config') + 1], 'utf8'));
+    assert.deepEqual(Object.keys(staging), ['apphosting']);
+    assert.equal(staging.apphosting[0].rootDir, 'web');
+    assert.equal(staging.apphosting[0].alwaysDeployFromSource, true);
+    assert.equal(options.timeout, 65 * 60 * 1000);
+    assert.ok(options.sourceModesPath.endsWith('.modes.json'));
+    assert.equal(fs.existsSync(path.join(options.cwd, 'web', '.env.local')), false);
+    assert.equal(fs.existsSync(path.join(options.cwd, 'web', 'app', 'api', 'health', 'route.js')), true);
+    assert.ok(!fs.readFileSync(path.join(options.cwd, 'web', 'next.config.mjs'), 'utf8').includes("output: 'export'"));
+    inspected = true; return { code: 0, stdout: JSON.stringify({ status: 'success', result: {} }), stderr: '' };
+  };
+  const response = await post('/api/project/deploy', { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', deploymentMode: 'apphosting', backendId: 'test-backend' });
+  assert.equal(response.status, 200);
+  const job = await completedJob(response.json.jobId);
+  assert.equal(job.status, 'completed', job.errorLog);
+  assert.equal(inspected, true);
+  assert.equal(job.liveUrl, runtimeBackend.uri);
+  assert.equal(job.rolloutName, runtimeBackend.name + '/rollouts/new-release');
+  assert.equal(fs.existsSync(path.join(app, '.env.local')), true);
+  assert.equal(fs.existsSync(path.join(app, 'firebase.json')), false);
+});
+
+test('interrupted App Hosting rollout stays unknown, blocks duplicate uploads, and can be checked safely', async t => {
+  const { root } = runtimeProject('runtime-interrupted');
+  t.mock.method(firebaseClient, 'billing', async () => true);
+  t.mock.method(firebaseClient, 'appHostingStatus', async () => ({ billingEnabled: true, backends: [runtimeBackend] }));
+  t.mock.method(firebaseClient, 'getBackend', async () => ({ name: runtimeBackend.name, uri: runtimeBackend.uri }));
+  t.mock.method(firebaseClient, 'listRollouts', async () => []);
+  t.mock.method(firebaseClient, 'assertNoActiveDeployment', async () => {});
+  let ready = false, uploads = 0;
+  t.mock.method(firebaseClient, 'verifyRollout', async () => { if (!ready) { const error = new Error('The new rollout is still building.'); error.state = 'pending'; throw error; } return { rolloutName: runtimeBackend.name + '/rollouts/recovered', buildName: runtimeBackend.name + '/builds/recovered' }; });
+  runMock = async () => { uploads++; return { code: 124, stdout: '', stderr: 'Command timed out.' }; };
+  const payload = { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', deploymentMode: 'apphosting', backendId: 'test-backend' };
+  const started = await post('/api/project/deploy', payload), job = await completedJob(started.json.jobId);
+  assert.equal(job.status, 'unknown'); assert.equal(job.liveUrl, ''); assert.match(job.message, /may still be running/); assert.match(job.consoleUrl, /^https:\/\/console\.firebase\.google\.com\//);
+  const duplicate = await post('/api/project/deploy', payload);
+  assert.equal(duplicate.status, 409); assert.equal(uploads, 1);
+  const pending = await post(`/api/jobs/${job.id}/check`, {}); assert.equal(pending.json.status, 'unknown');
+  ready = true;
+  const recovered = await post(`/api/jobs/${job.id}/check`, {});
+  assert.equal(recovered.json.status, 'completed'); assert.equal(recovered.json.liveUrl, runtimeBackend.uri); assert.equal(recovered.json.errorLog, ''); assert.equal(uploads, 1);
+});
+
+test('App Hosting never accepts CLI success without a newly verified rollout', async t => {
+  const { root } = runtimeProject('runtime-false-success');
+  t.mock.method(firebaseClient, 'billing', async () => true);
+  t.mock.method(firebaseClient, 'appHostingStatus', async () => ({ billingEnabled: true, backends: [runtimeBackend] }));
+  t.mock.method(firebaseClient, 'listRollouts', async () => []);
+  let active = false;
+  t.mock.method(firebaseClient, 'assertNoActiveDeployment', async () => { if (active) throw new Error('A cloud build is still active.'); });
+  t.mock.method(firebaseClient, 'verifyRollout', async () => { const error = new Error('No new rollout was created.'); error.state = 'unknown'; throw error; });
+  let backendReads = 0;
+  t.mock.method(firebaseClient, 'getBackend', async () => { backendReads++; return { uri: runtimeBackend.uri }; });
+  runMock = async () => ({ code: 0, stdout: JSON.stringify({ status: 'success' }), stderr: '' });
+  const started = await post('/api/project/deploy', { projectPath: root, appSubdir: 'web', firebaseProject: 'other-project', deploymentMode: 'apphosting', backendId: 'test-backend' });
+  const job = await completedJob(started.json.jobId);
+  assert.equal(job.status, 'unknown'); assert.equal(job.liveUrl, ''); assert.equal(backendReads, 0);
+  const missingAck = await post(`/api/jobs/${job.id}/acknowledge`, {}); assert.equal(missingAck.status, 400);
+  active = true;
+  const busyAck = await post(`/api/jobs/${job.id}/acknowledge`, { checkedFirebase: true }); assert.equal(busyAck.status, 400);
+  assert.equal((await request(`/api/jobs/${job.id}`)).json.status, 'unknown');
+  active = false;
+  const released = await post(`/api/jobs/${job.id}/acknowledge`, { checkedFirebase: true });
+  assert.equal(released.json.status, 'failed'); assert.equal(released.json.retryAllowed, true); assert.equal(released.json.liveUrl, '');
+});
+
+test('an already active App Hosting rollout stops before source upload', async t => {
+  const { root } = runtimeProject('runtime-existing-rollout');
+  t.mock.method(firebaseClient, 'billing', async () => true);
+  t.mock.method(firebaseClient, 'appHostingStatus', async () => ({ billingEnabled: true, backends: [runtimeBackend] }));
+  t.mock.method(firebaseClient, 'listRollouts', async () => [{ state: 'BUILDING', reconciling: true }]);
+  let uploads = 0; runMock = async () => { uploads++; throw new Error('Must not upload while an existing rollout is active.'); };
+  const started = await post('/api/project/deploy', { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', deploymentMode: 'apphosting', backendId: 'test-backend' });
+  const job = await completedJob(started.json.jobId);
+  assert.equal(job.status, 'failed'); assert.match(job.errorLog, /active cloud rollout/); assert.equal(uploads, 0);
+});
+
+test('App Hosting billing or missing backend blocks cloud deployment without creating resources', async t => {
+  const { root } = runtimeProject('runtime-billing');
+  let called = false;
+  runMock = async () => { called = true; throw new Error('Unexpected cloud mutation.'); };
+  t.mock.method(firebaseClient, 'billing', async () => false);
+  const response = await post('/api/project/deploy', { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', deploymentMode: 'apphosting', backendId: 'test-backend' });
+  assert.equal(response.status, 200);
+  const job = await completedJob(response.json.jobId);
+  assert.equal(job.status, 'failed'); assert.match(job.errorLog, /Blaze/); assert.equal(job.liveUrl, ''); assert.equal(called, false);
+  const setup = await post('/api/apphosting/setup', { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', backendId: 'test-backend', location: 'us-east4' });
+  assert.equal(setup.status, 400); assert.match(setup.json.error, /does not upgrade|will not upgrade/); assert.equal(called, false);
+});
+
+test('backend setup uses explicit validated creation and verifies the resulting backend', async t => {
+  const { root } = runtimeProject('runtime-setup');
+  t.mock.method(firebaseClient, 'billing', async () => true);
+  let checks = 0;
+  t.mock.method(firebaseClient, 'appHostingStatus', async () => ({ billingEnabled: true, locations: [{ id: 'us-east4' }], backends: checks++ ? [runtimeBackend] : [] }));
+  runMock = async (name, args) => {
+    assert.equal(name, 'firebase'); assert.equal(args[0], 'apphosting:backends:create'); assert.ok(args.includes('--non-interactive'));
+    assert.equal(args[args.indexOf('--backend') + 1], 'test-backend'); assert.equal(args[args.indexOf('--primary-region') + 1], 'us-east4');
+    return { code: 0, stdout: JSON.stringify({ status: 'success' }), stderr: '' };
+  };
+  const response = await post('/api/apphosting/setup', { projectPath: root, appSubdir: 'web', firebaseProject: 'test-project', backendId: 'test-backend', location: 'us-east4' });
+  assert.equal(response.status, 200); assert.equal(response.json.backendId, 'test-backend'); assert.equal(config.loadConfig().appHostingBackendId, 'test-backend');
+});
+
+test('GitHub repair publishes only app-generated changes through a captured baseline', async t => {
+  const root = staticProject('github-auto-repair'); fs.mkdirSync(path.join(root, '.git'));
+  const repair = require('../lib/git-repair'), github = require('../lib/github');
+  let baselineCount = 0, published;
+  t.mock.method(repair, 'captureRepairBaseline', async () => ({ dirtyFiles: [], stagedFiles: [], captured: ++baselineCount }));
+  t.mock.method(github, 'sync', async () => {});
+  t.mock.method(repair, 'publishRepair', async args => { published = args; return { branch: 'firebase-direct/repair-fixture', pullRequestUrl: 'https://github.com/example/app/pull/1', fixedFiles: args.files, commit: 'fixture-sha' }; });
+  const response = await post('/api/project/fix-github', { projectPath: root, firebaseProject: 'test-project', deploymentMode: 'hosting', appSubdir: '' });
+  assert.equal(response.status, 200);
+  const job = await completedJob(response.json.jobId);
+  assert.equal(job.status, 'completed', job.errorLog); assert.equal(job.type, 'github-repair'); assert.equal(job.pullRequestUrl, 'https://github.com/example/app/pull/1');
+  assert.ok(published.files.includes('firebase.json')); assert.ok(published.files.includes('.firebaserc'));
+  assert.ok(published.files.every(file => file in published.expectedHashes)); assert.ok(published.baseline.captured);
+  assert.equal(config.loadConfig().recentProjects.find(p => p.path === root).branch, 'firebase-direct/repair-fixture');
 });

@@ -26,7 +26,17 @@ AI analysis sends selected source files and the supplied problem description to 
 
 ## Deployment
 
-Deployment publishes the selected output to Firebase Hosting. Review the selected Firebase project and output before deploying. Keep server credentials and private files out of browser bundles, regardless of hosting ignore rules. Applications requiring a server runtime need an appropriate host and their own authentication, authorization, database rules, and security review.
+Static deployment publishes the selected output to Firebase Hosting. Next.js server deployment uses a selected Firebase App Hosting backend and a managed cloud build/rollout. Review the Firebase project, deployment mode, backend, and billing status before deploying. Creating a backend is a separate explicit operation; the app does not automatically upgrade billing.
+
+Source uploads exclude local environment and credential files. Configure server secrets through Firebase/Secret Manager and keep private credentials out of browser bundles regardless of upload exclusions. Application authentication, authorization, database access rules, migrations, and compatibility with external services still require application-specific review.
+
+## GitHub repair publishing
+
+The server captures Git state before app repairs and retains that snapshot in memory. Publishing requires the same repository, branch, and base commit, rejects existing staged changes, and refuses to include a repair file that already had local edits. Only the app's recorded file allowlist can enter the repair commit. File hashes detect edits made after the app prepared its fixes.
+
+Candidate paths, file contents, and the staged diff are checked for known saved credentials, common token formats, private keys, sensitive filenames, binary files, and symlink escapes. This detection is a safeguard, not proof that source contains no confidential data; review the pull request. Git hooks and executable filesystem monitors are disabled for repair commands. Repository-controlled clean filters and other code already running as your Windows user remain within the trusted-project boundary described above.
+
+Repairs use a generated branch and a generic author identity. GitHub tokens travel in the Git process environment and API headers, never repository URLs or command arguments. The app pushes without force and opens a pull request; it does not merge the default branch. If pushing or opening the pull request fails, it preserves the repair commit/branch and reports the remaining action. GitHub publishing requires Contents and Pull requests write permission in addition to repository read access.
 
 ## Dependency overrides
 

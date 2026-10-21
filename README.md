@@ -6,7 +6,7 @@ A local Windows dashboard for importing GitHub repositories, checking Firebase H
 
 [Download the ZIP](https://github.com/vaasiraq-art/firebase-direct-studio/archive/refs/heads/main.zip), extract it to a folder, then follow these steps. The download contains no saved accounts, API keys, private projects, or user settings. Each Windows user connects their own accounts.
 
-Install Node.js 22.16 or newer and Git for Windows. Double-click `Start-Firebase-Direct.bat` in this folder. The first launch installs the app's locked dependencies, including the Firebase CLI, and shows setup progress. An internet connection is required.
+Install Node.js 22.16+ or Node.js 24 and Git for Windows. Double-click `Start-Firebase-Direct.bat` in this folder. The first launch installs the app's locked dependencies, including the Firebase CLI, and shows setup progress. An internet connection is required.
 
 The launcher creates or refreshes the desktop icon automatically when it opens the browser. To recreate the icon manually, run:
 
@@ -23,10 +23,20 @@ For a terminal setup, run `npm ci`, then `npm start`. A separate global Firebase
 1. In **Connections**, connect GitHub using the account already signed in on your computer. The app checks GitHub CLI credentials, then Git Credential Manager. If neither is available, use a GitHub token with access to the repositories you need. Private and organization repositories only appear when the credential permits access; some organizations also require SSO authorization.
 2. Connect Firebase and finish Google's browser sign-in. Refresh the connection and choose your Firebase project.
 3. Import a repository, select its branch, or choose a local project folder. If the repository contains several apps, choose the app folder.
-4. Review the project checks and apply the available configuration fixes. AI code repair is optional.
-5. Choose **Deploy** to install dependencies, build the selected app, and publish to Firebase Hosting. Progress and errors come from the real commands. The live link appears after Firebase reports success.
+4. Review the project checks and apply the available configuration fixes. The app recommends **Firebase Hosting** for static sites and **Firebase App Hosting** for Next.js server features. AI code repair is optional.
+5. Choose the deployment destination and select **Deploy**. Static apps build locally; App Hosting uploads protected source for Cloud Build and a managed server rollout. Progress and errors come from the real operations. A live link appears after Firebase confirms success.
 
 Import and build repositories you trust: package installation and build scripts run on your Windows account. If you have local fixes, keep GitHub sync off until those changes are committed; the app will not discard them to force a pull.
+
+Use the theme switch in the top bar to choose light or dark mode. **Auto** follows your operating system theme; an explicit choice is saved in that browser.
+
+## Fix and sync GitHub
+
+Use **Fix & sync GitHub** to apply supported deployment repairs and open a pull request containing the app's recorded fixes. Reviewed AI changes can be included after you apply them. This requires repository **Contents: write** and **Pull requests: write** permissions; reading and importing repositories only requires read access.
+
+Start from the repository's default branch at its current GitHub commit. The app creates a new repair branch and stages only its recorded source/configuration files. It checks for credentials, rejects existing staged changes and files that had earlier local edits, and detects changes made after the app recorded its fixes. Unrelated local edits stay out of the commit.
+
+The default branch stays unchanged until you review and merge the pull request in GitHub. The repair branch remains checked out locally so you can inspect or deploy the fixes. If a push or pull request fails, the app preserves the local repair commit or pushed branch and reports how to recover; it does not force-push or delete your work.
 
 ## Optional AI repair
 
@@ -45,9 +55,15 @@ Model IDs are editable; availability, rate limits, billing, and provider policie
 
 ## Supported deployment targets
 
-Firebase **Hosting** serves static files. Static HTML sites and client applications with a build output can use this flow. Next.js projects need a valid static export; server APIs, server actions, databases, and other server runtime features cannot be made static just by changing a configuration value.
+**Firebase Hosting** serves static HTML and built client applications, including explicitly static Next.js exports. Its site address normally ends in `.web.app`. This mode does not run server APIs or server actions.
 
-Projects that need a server require an appropriate runtime and separate setup, such as Firebase App Hosting, Cloud Run, or another server host. Native desktop and mobile applications are not converted into websites. Firebase and AI billing or quotas are controlled by their respective providers; this app does not promise that every project is free to host.
+**Firebase App Hosting** runs supported Next.js applications with server rendering, API routes, server actions, and server-side database connections. Choose an existing backend or use **Create backend** after reviewing the project's billing status. App Hosting requires the **Blaze** plan, and builds/runtime usage can incur charges. The app does not upgrade your billing plan automatically. Its managed backend address ends in `.hosted.app`.
+
+Configure production environment variables, Secret Manager references, database credentials, and external service access in Firebase before deploying. Local `.env` and credential files are excluded from source uploads. Database migrations and adapting provider-specific services remain application work; selecting App Hosting does not automatically convert another provider's database or API into a Firebase service.
+
+App Hosting success requires a new successful rollout, a ready build, and the backend's verified live address. If the connection is interrupted, use **Check deployment status** or the Firebase console; a cloud operation can continue after the local command stops. The app blocks a duplicate upload while its result is unknown or an existing rollout is active.
+
+Native desktop and mobile applications are not converted into websites. Firebase and AI billing, quotas, supported framework versions, and availability are controlled by their respective providers; this app does not promise that every project is free to host.
 
 ## Credentials and local data
 

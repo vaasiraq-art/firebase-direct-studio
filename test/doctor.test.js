@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { inspectProject, applyAutoFixes, gatherProjectContextForAI, validateHostingOutput } = require('../doctor');
+const { inspectProject, applyAutoFixes, gatherProjectContextForAI, validateHostingOutput, validateAppHostingProject } = require('../doctor');
 
 function fixture(t, files) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'firebase-doctor-test-'));
@@ -248,4 +248,155 @@ test('AI discovers framework source files while excluding embedded provider keys
   assert.ok(files.includes('app/widgets/controls.tsx'));
   assert.ok(files.includes('lib/runtime.ts'));
   for (const name of ['openai', 'anthropic', 'stripe', 'settings', 'database', 'aws']) assert.equal(files.includes(`lib/${name}.ts`), false);
+});
+
+test('App Hosting detects a nested Next server app and preserves its APIs, actions, and database', t => {
+  const root = fixture(t, {
+    'package.json': { private: true, workspaces: ['store'] },
+    'store/package.json': { scripts: { build: 'next build' }, dependencies: { next: '15', pg: '8' } },
+    'store/next.config.ts': "import type {NextConfig} from 'next'; const config:NextConfig={serverExternalPackages:['pg'],experimental:{serverActions:{bodySizeLimit:'6mb'}}}; export default config;",
+    'store/app/api/orders/route.ts': "export async function POST(){ return Response.json({ok:true}); }",
+    'store/app/actions.ts': "'use server'; export async function save(){ return process.env.DATABASE_URL; }",
+    'store/middleware.ts': 'export function middleware() {}',
+    'store/.env': 'DATABASE_URL=secret://private-data'
+  });
+  const report = inspectProject(root, '', { deploymentMode: 'apphosting' });
+  assert.equal(report.relativeSubdir, 'store');
+  assert.equal(report.framework, 'nextjs');
+  assert.equal(report.deploymentMode, 'apphosting');
+  assert.equal(report.recommendedDeploymentMode, 'apphosting');
+  assert.equal(report.blocked, false);
+  assert.equal(report.expectedPublicDir, '');
+  assert.equal(report.outputReady, false);
+  assert.equal(report.capabilities.serverActions, true);
+  assert.equal(report.capabilities.apiRoutes, true);
+  assert.equal(report.capabilities.database, true);
+  assert.equal(report.capabilities.appHosting, true);
+  assert.equal(report.capabilities.staticHosting, false);
+  assert.ok(report.environmentVariables.includes('DATABASE_URL'));
+  assert.ok(!report.issues.some(issue => ['NEXTJS_STATIC_EXPORT', 'NEXTJS_SERVER_RUNTIME', 'BUILD_OUTPUT_PENDING', 'MISSING_FIREBASE_JSON'].includes(issue.id)));
+  const validated = validateAppHostingProject(report);
+  assert.equal(validated.sourceDir, path.join(root, 'store'));
+  assert.equal(validated.packageManager, 'npm');
+  assert.throws(() => validateHostingOutput(report), /cannot be used/);
+  const context = gatherProjectContextForAI(report.effectiveRoot);
+  assert.equal(context.some(file => file.filePath.startsWith('.env') || file.content.includes('secret://private-data')), false);
+});
+
+test('App Hosting safe fixes are a no-op for runtime Next.js configuration and static config is preserved', t => {
+  const next = "export default {serverExternalPackages:['pg'],poweredByHeader:false};";
+  const root = fixture(t, {
+    'package.json': { scripts: { build: 'next build' }, dependencies: { next: '15', pg: '8' } },
+    'next.config.mjs': next,
+    'firebase.json': '{old static config preserved even when not parseable',
+    '.firebaserc': '{old aliases preserved',
+    'app/api/route.ts': 'export function GET() { return Response.json({}) }'
+  });
+  const result = applyAutoFixes(root, 'example-app', { deploymentMode: 'apphosting' });
+  assert.equal(result.updatedInspection.blocked, false);
+  assert.deepEqual(result.changedFiles, []);
+  assert.equal(result.backupDir, '');
+  assert.equal(fs.readFileSync(path.join(root, 'next.config.mjs'), 'utf8'), next);
+  assert.equal(fs.readFileSync(path.join(root, 'firebase.json'), 'utf8'), '{old static config preserved even when not parseable');
+  assert.equal(fs.readFileSync(path.join(root, '.firebaserc'), 'utf8'), '{old aliases preserved');
+  validateAppHostingProject(result.updatedInspection);
+});
+
+test('App Hosting does not confuse comments, strings, or nested plugin output with Next static export', t => {
+  const originals = [
+    "// Before switching we had output: 'export'\nexport default {poweredByHeader:false};",
+    "export default {env:{DOCUMENTATION:\"output: 'export'\"},poweredByHeader:false};",
+    "export default {experimental:{plugin:{output:'export'}},poweredByHeader:false};"
+  ];
+  const root = fixture(t, { 'package.json': { scripts: { build: 'next build' }, dependencies: { next: '15' } } });
+  for (const source of originals) {
+    fs.writeFileSync(path.join(root, 'next.config.mjs'), source);
+    const result = applyAutoFixes(root, '', { deploymentMode: 'apphosting' });
+    assert.equal(result.updatedInspection.hasStaticExport, false);
+    assert.equal(result.updatedInspection.blocked, false);
+    assert.deepEqual(result.changedFiles, []);
+    assert.equal(fs.readFileSync(path.join(root, 'next.config.mjs'), 'utf8'), source);
+    validateAppHostingProject(result.updatedInspection);
+  }
+});
+
+test('App Hosting removes only an explicit literal static export and backs up its original config', t => {
+  const originals = [
+    "export default {output:'export',poweredByHeader:false};",
+    "export default {poweredByHeader:false, output:'export'};",
+    "module.exports={output:'export'};",
+    "import type {NextConfig} from 'next'; const nextConfig:NextConfig={images:{unoptimized:true}, /* preserve */ output:'export',serverExternalPackages:['pg']}; export default nextConfig;",
+    "const config={ 'output' /* comment */ : \"export\", experimental:{serverActions:{bodySizeLimit:'6mb'}} }; module.exports=config;"
+  ];
+  const root = fixture(t, {
+    'package.json': { scripts: { build: 'next build' }, dependencies: { next: '15', pg: '8' } },
+    'app/api/route.ts': 'export function POST() {}'
+  });
+  for (const original of originals) {
+    fs.writeFileSync(path.join(root, 'next.config.ts'), original);
+    const before = inspectProject(root, '', { deploymentMode: 'apphosting' });
+    assert.ok(before.issues.some(issue => issue.id === 'APPHOSTING_STATIC_EXPORT' && issue.autoFixable));
+    assert.throws(() => validateAppHostingProject(before), /Auto-Fix can remove/);
+    const result = applyAutoFixes(root, '', { deploymentMode: 'apphosting' });
+    assert.deepEqual(result.changedFiles, ['next.config.ts']);
+    assert.ok(result.backupDir && !result.backupDir.startsWith(root));
+    assert.equal(fs.readFileSync(path.join(result.backupDir, 'next.config.ts'), 'utf8'), original);
+    const after = fs.readFileSync(path.join(root, 'next.config.ts'), 'utf8');
+    assert.equal(/output[^:]*:\s*['"]export/.test(after), false);
+    assert.equal(result.updatedInspection.hasStaticExport, false);
+    assert.equal(fs.existsSync(path.join(root, 'firebase.json')), false);
+    assert.equal(fs.existsSync(path.join(root, '.firebaserc')), false);
+    assert.equal(fs.readFileSync(path.join(root, 'app/api/route.ts'), 'utf8'), 'export function POST() {}');
+    validateAppHostingProject(result.updatedInspection);
+  }
+});
+
+test('dynamic, wrapped, spread, and mutated static-export Next.js configs require manual edits', t => {
+  const originals = [
+    "export default plugin({output:'export'});",
+    "export default {...base,output:'export'};",
+    "const config={output:'export'}; config.images={unoptimized:true}; export default config;",
+    "const config={output:'export',output:'export'}; export default config;"
+  ];
+  const root = fixture(t, { 'package.json': { scripts: { build: 'next build' }, dependencies: { next: '15' } } });
+  for (const original of originals) {
+    fs.writeFileSync(path.join(root, 'next.config.mjs'), original);
+    const result = applyAutoFixes(root, '', { deploymentMode: 'apphosting' });
+    assert.equal(result.updatedInspection.blocked, true);
+    assert.deepEqual(result.changedFiles, []);
+    assert.equal(fs.readFileSync(path.join(root, 'next.config.mjs'), 'utf8'), original);
+    assert.throws(() => validateAppHostingProject(result.updatedInspection), /manually/);
+  }
+});
+
+test('App Hosting validates Next dependency, build script, npm package manager, and current source', t => {
+  const root = fixture(t, { 'package.json': { scripts: { build: 'next build' }, dependencies: { next: '15' }, packageManager: 'pnpm@9' } });
+  assert.ok(inspectProject(root, '', { deploymentMode: 'apphosting' }).issues.some(issue => issue.id === 'APPHOSTING_PACKAGE_MANAGER'));
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'next build' }, dependencies: { next: '15' } }));
+  const report = inspectProject(root, '', { deploymentMode: 'apphosting' });
+  validateAppHostingProject(report);
+  fs.writeFileSync(path.join(root, 'next.config.mjs'), "export default {output:'export'}");
+  assert.throws(() => validateAppHostingProject(report), /static export|Auto-Fix/);
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ dependencies: { next: '15' } }));
+  assert.ok(inspectProject(root, '', { deploymentMode: 'apphosting' }).issues.some(issue => issue.id === 'MISSING_BUILD_SCRIPT'));
+  assert.throws(() => inspectProject(root, '', { deploymentMode: 'invalid' }), /Deployment mode/);
+});
+
+test('App Hosting refuses native and static-only projects without generating Firebase config', t => {
+  const root = fixture(t, { 'index.html': 'static website', 'CMakeLists.txt': 'project(DesktopApp)' });
+  const result = applyAutoFixes(root, '', { deploymentMode: 'apphosting' });
+  assert.equal(result.updatedInspection.blocked, true);
+  assert.ok(result.updatedInspection.issues.some(issue => issue.id === 'APPHOSTING_FRAMEWORK_UNSUPPORTED'));
+  assert.deepEqual(result.changedFiles, []);
+  assert.equal(fs.existsSync(path.join(root, 'firebase.json')), false);
+});
+
+test('static Hosting reports the exact changed files and keeps App Hosting opt-in', t => {
+  const root = fixture(t, { 'index.html': 'site' });
+  const result = applyAutoFixes(root, 'example-app');
+  assert.deepEqual(result.changedFiles, ['firebase.json', '.firebaserc']);
+  assert.equal(result.updatedInspection.deploymentMode, 'hosting');
+  assert.equal(result.updatedInspection.recommendedDeploymentMode, 'hosting');
+  assert.deepEqual(applyAutoFixes(root, 'example-app').changedFiles, []);
+  assert.throws(() => validateAppHostingProject(result.updatedInspection), /Select App Hosting/);
 });
