@@ -63,7 +63,9 @@ async function fixture(t, overrides = {}) {
       }
       if (verb === 'push') return { code: control.pushFails ? 1 : 0, stdout: '', stderr: '' };
       if (verb === 'commit' && control.commitFails) return { code: 1, stdout: '', stderr: '' };
-      return realRun(name, args, options);
+      const result = await realRun(name, args, options);
+      if (verb === 'rev-parse' && args[index + 1] === '--show-toplevel' && control.topLevelPath) result.stdout = control.topLevelPath(root) + '\n';
+      return result;
     }
   });
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
@@ -71,6 +73,35 @@ async function fixture(t, overrides = {}) {
 }
 
 const change = root => fs.writeFileSync(path.join(root, 'firebase.json'), '{"hosting":{"public":"dist","ignore":["**/.*"]}}\n');
+
+test('Windows repository roots accept Git casing differences without case-folding distinct paths', { skip: process.platform !== 'win32' }, async t => {
+  const f = await fixture(t, { topLevelPath: root => root.toLowerCase() });
+  assert.notEqual(f.root, f.root.toLowerCase(), 'Fixture must exercise a casing difference.');
+  const baseline = await f.service.captureRepairBaseline(f.root);
+  change(f.root);
+  const result = await f.service.publishRepair({ projectPath: f.root.toUpperCase(), baseline, files: ['firebase.json'] });
+  assert.deepEqual(result.fixedFiles, ['firebase.json']);
+  assert.equal(result.pullRequestUrl, 'https://github.com/example/repair-app/pull/3');
+});
+
+test('repository aliases resolve to the same root while nested and different roots stay rejected', async t => {
+  const f = await fixture(t);
+  const aliasParent = fs.mkdtempSync(path.join(os.tmpdir(), 'fds-git-repair-alias-'));
+  const alias = path.join(aliasParent, 'repository');
+  t.after(() => fs.rmSync(aliasParent, { recursive: true, force: true }));
+  try { fs.symlinkSync(f.root, alias, process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) { if (!['EPERM', 'EACCES'].includes(error.code)) throw error; t.skip('Directory alias creation unavailable on this runner.'); return; }
+  const nested = path.join(f.root, 'nested');
+  fs.mkdirSync(nested);
+  await assert.rejects(f.service.captureRepairBaseline(nested), /Select the Git repository root/);
+  const baseline = await f.service.captureRepairBaseline(alias);
+  const different = await fixture(t);
+  await assert.rejects(f.service.publishRepair({ projectPath: different.root, baseline, files: ['firebase.json'] }), /selected repository changed/);
+  change(f.root);
+  const result = await f.service.publishRepair({ projectPath: f.root, baseline, files: ['firebase.json'] });
+  assert.deepEqual(result.fixedFiles, ['firebase.json']);
+  assert.equal(result.pullRequestUrl, 'https://github.com/example/repair-app/pull/3');
+});
 
 test('publishes only app files on a repair branch and preserves unrelated local edits', async t => {
   const f = await fixture(t);
